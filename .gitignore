@@ -1,0 +1,8 @@
+*.glb
+*.blend
+*.blend1
+*.prompt.json
+__pycache__/
+review*/
+out/
+work/

@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GLB-Viewer</title>
+<style>
+  :root { --bg: #2b2d31; --panel: rgba(20,21,24,.82); --ink: #eceef2; --muted: #a4a9b3; --accent: #7cc4ff; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); font: 14px/1.4 system-ui, sans-serif; }
+  #view { position: fixed; inset: 0; }
+  #panel { position: fixed; top: 12px; left: 12px; width: 280px; max-height: calc(100% - 24px); overflow: auto;
+           background: var(--panel); border-radius: 10px; padding: 12px 14px; box-sizing: border-box; }
+  h1 { font-size: 15px; margin: 0 0 6px; }
+  .muted { color: var(--muted); font-size: 12px; }
+  label { display: block; margin: 8px 0 2px; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  select, button, input[type=text] { width: 100%; box-sizing: border-box; margin-top: 4px; padding: 6px; border-radius: 6px;
+           border: 1px solid #555; background: #1c1d20; color: var(--ink); font: inherit; }
+  button { cursor: pointer; }
+  .row { display: flex; gap: 6px; } .row > * { flex: 1; }
+  details { margin-top: 10px; } summary { cursor: pointer; color: var(--accent); }
+  #err { color: #ff9b8f; white-space: pre-wrap; }
+  @media (max-width: 600px) { #panel { width: auto; right: 12px; max-height: 45%; } }
+</style>
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.162.0/build/three.module.js",
+               "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.162.0/examples/jsm/" } }
+</script>
+</head>
+<body>
+<div id="view"></div>
+<div id="panel">
+  <h1>GLB-Viewer</h1>
+  <div class="muted" id="info">lädt …</div>
+  <input type="text" id="url" placeholder="pfad/zu/figur.glb">
+  <button id="load">Laden</button>
+  <div id="err"></div>
+  <label>Animation</label>
+  <select id="anim"><option value="">– Ruhepose –</option></select>
+  <div class="row"><button id="play">▶︎ / ❚❚</button><button id="reset">Ausdrücke 0</button></div>
+  <details open><summary>Ausdrücke (Morph Targets)</summary><div id="morphs" class="muted">keine</div></details>
+  <details><summary>Ansicht</summary>
+    <label><input type="checkbox" id="wire"> Drahtgitter</label>
+    <label><input type="checkbox" id="rot" checked> langsam drehen</label>
+  </details>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+const $ = id => document.getElementById(id);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.toneMapping = THREE.NeutralToneMapping;
+$('view').appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x2b2d31);
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+const key = new THREE.DirectionalLight(0xffffff, 1.2); key.position.set(-2, 3, 3); scene.add(key);
+const camera = new THREE.PerspectiveCamera(30, 1, 0.01, 100);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+const loader = new GLTFLoader().setMeshoptDecoder(MeshoptDecoder);
+const clock = new THREE.Clock();
+let root = null, mixer = null, action = null, clips = [], morphMeshes = [];
+window.viewer = { scene, camera, controls, get root() { return root; } };   // for debugging in the console
+
+function resize() { const w = innerWidth, h = innerHeight; renderer.setSize(w, h); camera.aspect = w / h; camera.updateProjectionMatrix(); }
+addEventListener('resize', resize); resize();
+
+function frame(obj) {
+  // skinned meshes: bounds need the posed bones, so update matrices and skeletons first and drop cached boxes
+  obj.updateMatrixWorld(true);
+  obj.traverse(o => { if (o.isSkinnedMesh) { o.skeleton.update(); o.boundingBox = null; o.boundingSphere = null; } });
+  const box = new THREE.Box3().setFromObject(obj), size = box.getSize(new THREE.Vector3()), c = box.getCenter(new THREE.Vector3());
+  const d = size.y / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2))) * 1.25;
+  camera.position.set(c.x, c.y + size.y * 0.05, c.z + d); camera.near = d / 100; camera.far = d * 100; camera.updateProjectionMatrix();
+  controls.target.copy(c); controls.update();
+}
+
+function buildMorphUI() {
+  const names = new Map();                       // name -> [ [mesh, index], ... ] (same name on several meshes moves together)
+  morphMeshes.forEach(m => Object.entries(m.morphTargetDictionary || {}).forEach(([n, i]) => {
+    if (!names.has(n)) names.set(n, []); names.get(n).push([m, i]); }));
+  const box = $('morphs'); box.innerHTML = '';
+  if (!names.size) { box.textContent = 'keine'; return; }
+  box.classList.remove('muted');
+  [...names.keys()].sort().forEach(n => {
+    const l = document.createElement('label'); l.textContent = n;
+    const r = document.createElement('input'); Object.assign(r, { type: 'range', min: 0, max: 1, step: 0.01, value: 0 });
+    r.oninput = () => names.get(n).forEach(([m, i]) => m.morphTargetInfluences[i] = +r.value);
+    box.append(l, r);
+  });
+}
+
+function load(url) {
+  $('err').textContent = ''; $('info').textContent = 'lädt ' + url + ' …';
+  loader.load(url, g => {
+    if (root) scene.remove(root);
+    root = g.scene; scene.add(root); frame(root);
+    morphMeshes = []; let tris = 0;
+    root.traverse(o => { if (o.isMesh) {
+      if (o.morphTargetInfluences) morphMeshes.push(o);
+      const idx = o.geometry.index; tris += (idx ? idx.count : o.geometry.attributes.position.count) / 3; } });
+    clips = g.animations; mixer = clips.length ? new THREE.AnimationMixer(root) : null; action = null;
+    $('anim').innerHTML = '<option value="">– Ruhepose –</option>' + clips.map((c, i) => `<option value="${i}">${c.name} (${c.duration.toFixed(1)} s)</option>`).join('');
+    buildMorphUI();
+    $('info').textContent = `${url.split('/').pop()} · ${Math.round(tris).toLocaleString('de')} Dreiecke · ${clips.length} Animationen · ${morphMeshes.length} Meshes mit Morphs`;
+  }, undefined, e => { $('err').textContent = 'Fehler: ' + (e.message || e); $('info').textContent = ''; });
+}
+
+$('anim').onchange = () => {
+  if (!mixer) return; mixer.stopAllAction(); action = null;
+  const i = $('anim').value; if (i === '') return;
+  action = mixer.clipAction(clips[+i]); action.play(); $('rot').checked = false;
+};
+$('play').onclick = () => { if (action) action.paused = !action.paused; };
+$('reset').onclick = () => { morphMeshes.forEach(m => m.morphTargetInfluences.fill(0)); document.querySelectorAll('#morphs input').forEach(r => r.value = 0); };
+$('wire').onchange = () => root && root.traverse(o => { if (o.isMesh) [].concat(o.material).forEach(m => m.wireframe = $('wire').checked); });
+$('load').onclick = () => { const u = $('url').value.trim(); if (u) { history.replaceState(null, '', '?model=' + encodeURIComponent(u)); load(u); } };
+
+const q = new URLSearchParams(location.search).get('model');
+if (q) { $('url').value = q; load(q); } else $('info').textContent = 'Pfad oder URL zu einem .glb eingeben, oder ?model=… an die Adresse hängen.';
+
+renderer.setAnimationLoop(() => {
+  const dt = clock.getDelta();
+  if (mixer) mixer.update(dt);
+  if (root && $('rot').checked) root.rotation.y += dt * 0.3;
+  controls.update(); renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
